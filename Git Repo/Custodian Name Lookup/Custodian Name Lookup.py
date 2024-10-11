@@ -1,34 +1,52 @@
 import sys
 import re
 import traceback
+import os
+import subprocess
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QTextEdit, QPushButton, QFileDialog, QLabel, QSlider, QCheckBox,
                              QMessageBox)
-from PyQt6.QtGui import QFont, QTextCharFormat, QColor
-from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont, QTextCharFormat, QColor, QTextCursor
+from PyQt6.QtCore import Qt, QTimer
 from fuzzywuzzy import fuzz
 import pandas as pd
 
 class HighlightedTextEdit(QTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.highlighted_text = ""
 
-    def highlight_text(self, text):
-        self.highlighted_text = text.lower()
-        self.highlight()
-
-    def highlight(self):
-        cursor = self.textCursor()
-        format = QTextCharFormat()
-        format.setBackground(QColor(255, 255, 0))  # Yellow background
-
-        cursor.setPosition(0)
-        while not cursor.atEnd():
-            cursor.movePosition(cursor.MoveOperation.NextWord, cursor.MoveMode.KeepAnchor)
-            if cursor.selectedText().lower() in self.highlighted_text:
-                cursor.mergeCharFormat(format)
-            cursor.movePosition(cursor.MoveOperation.NextWord)
+    def highlight_text(self, results):
+        self.clear()
+        cursor = QTextCursor(self.document())
+        default_format = QTextCharFormat()
+        
+        for client_item, matches, similar_matches in results:
+            cursor.insertText(f"Client Item: {client_item}\n", default_format)
+            
+            if not matches and not similar_matches:
+                # No matches - highlight in red
+                format = QTextCharFormat()
+                format.setBackground(QColor(255, 200, 200))  # Light red
+                cursor.insertText("No matches found.\n", format)
+            elif matches:
+                # Exact matches - highlight in green
+                format = QTextCharFormat()
+                format.setBackground(QColor(200, 255, 200))  # Light green
+                cursor.insertText("Exact Matches:\n", default_format)
+                for match in matches:
+                    cursor.insertText("  - ", default_format)
+                    cursor.insertText(f"{match}\n", format)
+            elif similar_matches:
+                # Similar matches - highlight in yellow
+                format = QTextCharFormat()
+                format.setBackground(QColor(255, 255, 200))  # Light yellow
+                cursor.insertText("Similar Matches:\n", default_format)
+                for match, ratio in similar_matches[:5]:
+                    cursor.insertText("  - ", default_format)
+                    cursor.insertText(f"{match}", format)
+                    cursor.insertText(f" (Similarity: {ratio}%)\n", default_format)
+            
+            cursor.insertText("\n", default_format)
 
 class CustodianMatcher(QMainWindow):
     def __init__(self):
@@ -49,6 +67,7 @@ class CustodianMatcher(QMainWindow):
         left_layout = QVBoxLayout()
         left_label = QLabel("Relativity Custodians:")
         self.left_text = QTextEdit()
+        self.left_text.textChanged.connect(self.schedule_search)
         left_button = QPushButton("Load from file")
         left_button.clicked.connect(lambda: self.load_file(self.left_text))
         left_layout.addWidget(left_label)
@@ -59,6 +78,7 @@ class CustodianMatcher(QMainWindow):
         right_layout = QVBoxLayout()
         right_label = QLabel("Client Search List:")
         self.right_text = QTextEdit()
+        self.right_text.textChanged.connect(self.schedule_search)
         right_button = QPushButton("Load from file")
         right_button.clicked.connect(lambda: self.load_file(self.right_text))
         right_layout.addWidget(right_label)
@@ -72,13 +92,14 @@ class CustodianMatcher(QMainWindow):
         fuzzy_layout = QHBoxLayout()
         self.fuzzy_checkbox = QCheckBox("Enable Fuzzy Search")
         self.fuzzy_checkbox.setChecked(False)
+        self.fuzzy_checkbox.stateChanged.connect(self.toggle_fuzzy_search)
         self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self.threshold_slider.setRange(50, 100)
         self.threshold_slider.setValue(80)
         self.threshold_slider.setEnabled(False)
-        self.threshold_label = QLabel("Threshold: 80%")
-        self.fuzzy_checkbox.stateChanged.connect(self.toggle_fuzzy_search)
         self.threshold_slider.valueChanged.connect(self.update_threshold_label)
+        self.threshold_slider.setInvertedAppearance(True)  # Invert the slider
+        self.threshold_label = QLabel("Fuzziness: 20% (80% similarity required)")
         fuzzy_layout.addWidget(self.fuzzy_checkbox)
         fuzzy_layout.addWidget(self.threshold_slider)
         fuzzy_layout.addWidget(self.threshold_label)
@@ -93,11 +114,8 @@ class CustodianMatcher(QMainWindow):
 
         # Buttons
         button_layout = QHBoxLayout()
-        search_button = QPushButton("Search")
-        search_button.clicked.connect(self.perform_search)
         export_button = QPushButton("Export to Excel")
         export_button.clicked.connect(self.export_to_excel)
-        button_layout.addWidget(search_button)
         button_layout.addWidget(export_button)
 
         main_layout.addLayout(top_layout)
@@ -108,6 +126,11 @@ class CustodianMatcher(QMainWindow):
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
 
+        # Timer for delayed search
+        self.search_timer = QTimer()
+        self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(self.perform_search)
+
     def load_file(self, text_edit):
         file_name, _ = QFileDialog.getOpenFileName(self, "Open Text File", "", "Text Files (*.txt)")
         if file_name:
@@ -116,19 +139,25 @@ class CustodianMatcher(QMainWindow):
 
     def toggle_fuzzy_search(self, state):
         self.threshold_slider.setEnabled(state == Qt.CheckState.Checked.value)
+        self.schedule_search()
 
     def update_threshold_label(self, value):
-        self.threshold_label.setText(f"Threshold: {value}%")
+        fuzziness = 100 - value
+        self.threshold_label.setText(f"Fuzziness: {fuzziness}% ({value}% similarity required)")
+        self.schedule_search()
+
+    def schedule_search(self):
+        self.search_timer.start(300)  # 300 ms delay
 
     def preprocess_text(self, text):
         return re.sub(r'[^\w\s]', '', text.lower()).strip()
 
     def perform_search(self):
         try:
-            relativity_custodians = self.left_text.toPlainText().split('\n')
-            client_search_list = self.right_text.toPlainText().split('\n')
+            relativity_custodians = [c.strip() for c in self.left_text.toPlainText().split('\n') if c.strip()]
+            client_search_list = [c.strip() for c in self.right_text.toPlainText().split('\n') if c.strip()]
             use_fuzzy = self.fuzzy_checkbox.isChecked()
-            threshold = self.threshold_slider.value() if use_fuzzy else 100
+            similarity_threshold = self.threshold_slider.value()
 
             results = []
             for client_item in client_search_list:
@@ -142,8 +171,8 @@ class CustodianMatcher(QMainWindow):
                     if preprocessed_client_item in preprocessed_custodian or preprocessed_custodian in preprocessed_client_item:
                         matches.append(custodian)
                     elif use_fuzzy:
-                        similarity_ratio = fuzz.partial_ratio(preprocessed_client_item, preprocessed_custodian)
-                        if similarity_ratio >= threshold:
+                        similarity_ratio = fuzz.ratio(preprocessed_client_item, preprocessed_custodian)
+                        if similarity_ratio >= similarity_threshold:
                             similar_matches.append((custodian, similarity_ratio))
 
                 similar_matches.sort(key=lambda x: x[1], reverse=True)
@@ -157,21 +186,7 @@ class CustodianMatcher(QMainWindow):
 
     def display_results(self, results):
         try:
-            output = ""
-            for client_item, matches, similar_matches in results:
-                output += f"Client Item: {client_item}\n"
-                output += "Exact Matches:\n"
-                for match in matches:
-                    output += f"  - {match}\n"
-                if self.fuzzy_checkbox.isChecked():
-                    output += "Similar Matches:\n"
-                    for match, ratio in similar_matches:
-                        output += f"  - {match} (Similarity: {ratio}%)\n"
-                output += "\n"
-
-            self.bottom_text.setPlainText(output)
-            if results:
-                self.bottom_text.highlight_text(results[0][0])  # Highlight the first client item
+            self.bottom_text.highlight_text(results)
         except Exception as e:
             error_msg = f"An error occurred while displaying results:\n\n{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             QMessageBox.critical(self, "Error", error_msg)
@@ -189,6 +204,9 @@ class CustodianMatcher(QMainWindow):
             results = self.parse_results()
             df = pd.DataFrame(results, columns=['Client Item', 'Exact Matches', 'Similar Matches'])
             df.to_excel(file_name, index=False)
+            
+            # Automatically open the Excel file
+            self.open_file(file_name)
         except Exception as e:
             error_msg = f"An error occurred during Excel export:\n\n{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             QMessageBox.critical(self, "Error", error_msg)
@@ -218,6 +236,13 @@ class CustodianMatcher(QMainWindow):
             results.append((current_item, ', '.join(exact_matches), ', '.join(similar_matches)))
 
         return results
+
+    def open_file(self, filename):
+        if sys.platform == "win32":
+            os.startfile(filename)
+        else:
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.call([opener, filename])
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
