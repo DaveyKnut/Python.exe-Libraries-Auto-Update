@@ -1,10 +1,10 @@
 # Import required modules
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QPushButton, QTableView, QLineEdit,
-    QComboBox, QLabel, QWidget, QFileDialog, QTextEdit, QMessageBox, QDateEdit, QListWidget
+    QComboBox, QLabel, QWidget, QFileDialog, QTextEdit, QMessageBox, QDateEdit, QListWidget, QDialog
 )
 from PySide6.QtCore import Qt, QMimeData, QPoint, QAbstractTableModel, QModelIndex
-from PySide6.QtGui import QKeySequence, QShortcut, QDrag
+from PySide6.QtGui import QKeySequence, QShortcut, QDrag, QFont
 import pyperclip
 import polars as pl
 import sys
@@ -76,14 +76,21 @@ class QueryConditionWidget(QWidget):
             layout.addWidget(self.value_widget)
             layout.addWidget(self.value_widget_end)
         else:
-            self.operator_combo.addItems(['is set', 'is not set', 'equals', 'does not equal', 'contains'])
+            self.operator_combo.addItems([
+                'contains', 
+                'does not contain', 
+                'equals', 
+                'does not equal', 
+                'is set', 
+                'is not set'
+            ])
             self.value_widget = QLineEdit()
             layout.addWidget(self.field_label)
             layout.addWidget(self.operator_combo)
             layout.addWidget(self.value_widget)
 
         # Connect signals
-        self.operator_combo.currentTextChanged.connect(self.value_changed)
+        self.operator_combo.currentTextChanged.connect(self.operator_changed)
         if isinstance(self.value_widget, QDateEdit):
             self.value_widget.dateChanged.connect(self.value_changed)
             self.value_widget_end.dateChanged.connect(self.value_changed)
@@ -94,12 +101,42 @@ class QueryConditionWidget(QWidget):
         remove_btn.clicked.connect(self.remove_condition)
         layout.addWidget(remove_btn)
 
-    def value_changed(self):
-        # Find the QueryBuilderWidget parent and call its update method
+    def operator_changed(self):
+        """Handle operator changes"""
+        operator = self.operator_combo.currentText()
+        # Show/hide value widget based on operator
+        if operator in ['is set', 'is not set']:
+            self.value_widget.hide()
+        else:
+            self.value_widget.show()
+        
+        # Update the query list
         parent = self.parent()
         while parent and not isinstance(parent, QueryBuilderWidget):
             parent = parent.parent()
         if parent:
+            # Find this condition in the query list and update it
+            condition_text = parent.get_condition_text(self)
+            for i in range(parent.query_list.count()):
+                item = parent.query_list.item(i)
+                if item.text().startswith(self.field_label.text()):
+                    item.setText(condition_text)
+                    break
+            parent.update_query_preview()
+
+    def value_changed(self):
+        """Handle value changes"""
+        parent = self.parent()
+        while parent and not isinstance(parent, QueryBuilderWidget):
+            parent = parent.parent()
+        if parent:
+            # Find this condition in the query list and update it
+            condition_text = parent.get_condition_text(self)
+            for i in range(parent.query_list.count()):
+                item = parent.query_list.item(i)
+                if item.text().startswith(self.field_label.text()):
+                    item.setText(condition_text)
+                    break
             parent.update_query_preview()
 
     def remove_condition(self):
@@ -163,19 +200,47 @@ class QueryBuilderWidget(QWidget):
         self.main_app = main_app
         self.layout = QVBoxLayout(self)
         
-        # Operator buttons
+        # Operator buttons layout
         self.operator_layout = QHBoxLayout()
         self.and_btn = QPushButton("AND")
         self.or_btn = QPushButton("OR")
         self.bracket_left_btn = QPushButton("(")
         self.bracket_right_btn = QPushButton(")")
+        self.clear_btn = QPushButton("Clear Query")  # Add clear button
         
+        # Style the clear button
+        self.clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff6b6b;
+                color: white;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #ff5252;
+            }
+        """)
+        
+        # Connect operator buttons
+        self.and_btn.clicked.connect(lambda: self.add_operator("AND"))
+        self.or_btn.clicked.connect(lambda: self.add_operator("OR"))
+        self.bracket_left_btn.clicked.connect(lambda: self.add_operator("("))
+        self.bracket_right_btn.clicked.connect(lambda: self.add_operator(")"))
+        self.clear_btn.clicked.connect(self.clear_query)  # Connect clear button
+        
+        # Add buttons to layout
         self.operator_layout.addWidget(self.and_btn)
         self.operator_layout.addWidget(self.or_btn)
         self.operator_layout.addWidget(self.bracket_left_btn)
         self.operator_layout.addWidget(self.bracket_right_btn)
+        self.operator_layout.addWidget(self.clear_btn)
         
         self.layout.addLayout(self.operator_layout)
+        
+        # Add a list widget to show the query structure
+        self.query_list = QListWidget()
+        self.query_list.setSelectionMode(QListWidget.SingleSelection)
+        self.layout.addWidget(self.query_list)
         
         # Conditions container
         self.conditions_widget = QWidget()
@@ -198,22 +263,120 @@ class QueryBuilderWidget(QWidget):
         """)
         self.layout.addWidget(self.run_query_btn)
 
-    def update_query_preview(self):
-        """Update the SQL-like query preview based on current conditions"""
-        query_parts = []
-        for i in range(self.conditions_layout.count()):
-            widget = self.conditions_layout.itemAt(i).widget()
-            if isinstance(widget, QueryConditionWidget):
-                field = widget.field_label.text()
-                operator = widget.operator_combo.currentText()
-                if isinstance(widget.value_widget, QDateEdit):
-                    value = widget.value_widget.date().toString("yyyy-MM-dd")
-                else:
-                    value = widget.value_widget.text()
-                query_parts.append(f"{field} {operator} '{value}'")
+    def add_operator(self, operator):
+        """Add logical operator or bracket to the query"""
+        # Only add operator if there's already a condition
+        if self.query_list.count() > 0 and operator in ["AND", "OR"]:
+            # Don't add operator if the last item was already an operator
+            last_item = self.query_list.item(self.query_list.count() - 1).text()
+            if last_item not in ["AND", "OR", "("]:
+                self.query_list.addItem(operator)
+                self.update_query_preview()
+        elif operator in ["(", ")"]:
+            self.query_list.addItem(operator)
+            self.update_query_preview()
+
+    def add_condition(self, field_name, field_type):
+        """Create and add a new condition widget"""
+        condition_widget = QueryConditionWidget(field_name, field_type, self)
+        self.conditions_layout.addWidget(condition_widget)
         
-        query = " AND ".join(query_parts)
+        # Add empty condition to query list (will be updated when operator is selected)
+        condition_text = self.get_condition_text(condition_widget)
+        self.query_list.addItem(condition_text)
+        self.update_query_preview()
+
+    def get_condition_text(self, widget):
+        """Get readable text representation of a condition"""
+        field = widget.field_label.text()
+        operator = widget.operator_combo.currentText()
+        
+        if isinstance(widget.value_widget, QDateEdit):
+            value = widget.value_widget.date().toString("MM/dd/yyyy")
+            if operator == "is between":
+                end_value = widget.value_widget_end.date().toString("MM/dd/yyyy")
+                return f"{field} {operator} {value} AND {end_value}"
+            return f"{field} {operator} {value}"
+        else:
+            value = widget.value_widget.text() if widget.value_widget.text() else ""
+            # Make sure we preserve the original operator from the combo box
+            return f"{field} {operator} {value}"
+
+    def update_query_preview(self):
+        """Update the query preview based on the query list"""
+        query_parts = []
+        for i in range(self.query_list.count()):
+            item = self.query_list.item(i).text()
+            query_parts.append(item)
+        
+        query = " ".join(query_parts)
         self.main_app.query_preview.setText(query)
+
+    def build_polars_query(self):
+        """Build the Polars query expression from the query list"""
+        # Debug print to see what's in the query list
+        print("Building query from list:")
+        for i in range(self.query_list.count()):
+            print(f"Item {i}: {self.query_list.item(i).text()}")
+
+        if self.query_list.count() == 0:
+            print("No items in query list")
+            return None
+
+        # Get the first item for a simple query
+        first_item = self.query_list.item(0).text()
+        expr = self.convert_to_polars_expr(first_item)
+        print(f"Generated expression: {expr}")
+        return expr
+
+    def convert_to_polars_expr(self, condition_text):
+        """Convert a condition text to Polars expression"""
+        print(f"Converting condition: {condition_text}")
+        
+        try:
+            parts = condition_text.split(" ")
+            field = parts[0]
+            operator = parts[1]
+            
+            # Get the full value by joining remaining parts (for values that might contain spaces)
+            value = " ".join(parts[2:]) if len(parts) > 2 else ""
+            
+            # Handle different operators
+            if operator == "contains":
+                return f"pl.col('{field}').str.contains('{value}')"
+            elif operator == "does" and parts[2] == "not" and parts[3] == "contain":
+                value = " ".join(parts[4:])  # Get value after "does not contain"
+                return f"~pl.col('{field}').str.contains('{value}')"  # Note the ~ operator for negation
+            elif operator == "is" and parts[2] == "set":
+                return f"pl.col('{field}').is_not_null()"
+            elif operator == "is" and parts[2] == "not" and parts[3] == "set":
+                return f"pl.col('{field}').is_null()"
+            elif operator == "equals":
+                return f"pl.col('{field}') == '{value}'"
+            elif operator == "does" and parts[2] == "not" and parts[3] == "equal":
+                value = " ".join(parts[4:])  # Get value after "does not equal"
+                return f"pl.col('{field}') != '{value}'"
+                
+        except Exception as e:
+            print(f"Error converting condition: {e}")
+            return None
+
+    def clear_query(self):
+        """Clear all conditions and the query list"""
+        # Clear the query list
+        self.query_list.clear()
+        
+        # Clear all condition widgets
+        while self.conditions_layout.count():
+            child = self.conditions_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        
+        # Clear the query preview
+        self.main_app.query_preview.clear()
+        
+        # Optional: Show confirmation message
+        QMessageBox.information(self, "Success", "Query cleared successfully!")
 
 
 class PolarsTableModel(QAbstractTableModel):
@@ -443,83 +606,13 @@ class PolarsQueryApp(QMainWindow):
             return
 
         try:
-            # Build the query expression from conditions
-            query_conditions = []
-            for i in range(self.query_builder.conditions_layout.count()):
-                widget = self.query_builder.conditions_layout.itemAt(i).widget()
-                if isinstance(widget, QueryConditionWidget):
-                    field = widget.field_label.text()
-                    operator = widget.operator_combo.currentText()
-                    
-                    if isinstance(widget.value_widget, QDateEdit):
-                        # Input date format (from the DAT file)
-                        input_date_format = "%m/%d/%Y"
-                        # Get the date in the correct format
-                        value = widget.value_widget.date().toString("MM/dd/yyyy")
-                        
-                        if operator == "is before":
-                            condition = (
-                                f"pl.col('{field}')"
-                                f".str.strip_chars()"  # Use Polars strip_chars instead of strip
-                                f".str.slice(0, 10)"  # Take only the first 10 characters (MM/DD/YYYY)
-                                f".str.strptime(pl.Date, format='{input_date_format}')"
-                                f".lt(pl.lit('{value}').str.strptime(pl.Date, format='{input_date_format}'))"
-                            )
-                        elif operator == "is after":
-                            condition = (
-                                f"pl.col('{field}')"
-                                f".str.strip_chars()"
-                                f".str.slice(0, 10)"
-                                f".str.strptime(pl.Date, format='{input_date_format}')"
-                                f".gt(pl.lit('{value}').str.strptime(pl.Date, format='{input_date_format}'))"
-                            )
-                        elif operator == "is on":
-                            condition = (
-                                f"pl.col('{field}')"
-                                f".str.strip_chars()"
-                                f".str.slice(0, 10)"
-                                f".str.strptime(pl.Date, format='{input_date_format}')"
-                                f".eq(pl.lit('{value}').str.strptime(pl.Date, format='{input_date_format}'))"
-                            )
-                        elif operator == "is not set":
-                            condition = f"pl.col('{field}').is_null()"
-                        elif operator == "is between":
-                            start_date = value
-                            end_date = widget.value_widget_end.date().toString("MM/dd/yyyy")
-                            condition = (
-                                f"(pl.col('{field}').str.strip_chars().str.slice(0, 10)"
-                                f".str.strptime(pl.Date, format='{input_date_format}')"
-                                f".gt(pl.lit('{start_date}').str.strptime(pl.Date, format='{input_date_format}'))"
-                                f" & pl.col('{field}').str.strip_chars().str.slice(0, 10)"
-                                f".str.strptime(pl.Date, format='{input_date_format}')"
-                                f".lt(pl.lit('{end_date}').str.strptime(pl.Date, format='{input_date_format}')))"
-                            )
-                    else:
-                        value = widget.value_widget.text()
-                        # Handle text field conditions
-                        if operator == "is set":
-                            condition = f"pl.col('{field}').is_not_null()"
-                        elif operator == "is not set":
-                            condition = f"pl.col('{field}').is_null()"
-                        elif operator == "equals":
-                            condition = f"pl.col('{field}') == '{value}'"
-                        elif operator == "does not equal":
-                            condition = f"pl.col('{field}') != '{value}'"
-                        elif operator == "contains":
-                            condition = f"pl.col('{field}').str.contains('{value}')"
-                        else:
-                            continue
-
-                    query_conditions.append(condition)
-
-            if not query_conditions:
-                QMessageBox.warning(self, "Warning", "Please add some query conditions first!")
+            # Get the query expression
+            query_expr = self.query_builder.build_polars_query()
+            
+            if not query_expr:
+                QMessageBox.warning(self, "Warning", "Please build a valid query first!")
                 return
 
-            # Combine conditions with AND
-            query_expr = " & ".join(query_conditions)
-            
-            # Print the query for debugging
             print(f"Executing query: {query_expr}")
             
             # Execute the query
@@ -532,21 +625,58 @@ class PolarsQueryApp(QMainWindow):
             # Resize columns to content
             self.results_view.resizeColumnsToContents()
             
-            # Show success message
             QMessageBox.information(self, "Success", f"Query executed successfully! Found {len(self.result_df)} rows.")
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to execute query: {str(e)}")
-            print(f"Detailed error: {e}")  # For debugging
+            print(f"Detailed error: {e}")
 
     def show_statistics(self):
-        if self.dataset is None:
-            QMessageBox.warning(self, "Warning", "Load a dataset first!")
+        """Show basic statistics about the current dataset or query results"""
+        if self.result_df is not None:
+            df = self.result_df
+        elif self.dataset is not None:
+            df = self.dataset
+        else:
+            QMessageBox.warning(self, "Warning", "No data loaded!")
             return
 
-        stats = self.dataset.describe()
-        stats_str = stats.to_string()
-        QMessageBox.information(self, "Statistics", stats_str)
+        try:
+            # Calculate statistics
+            stats = df.describe()
+            
+            # Create a formatted string representation
+            stats_str = ""
+            
+            # Add column headers
+            stats_str += "Column\t" + "\t".join(str(col) for col in stats.columns) + "\n"
+            
+            # Add rows
+            for row in stats.rows():
+                stats_str += "\t".join(str(val) for val in row) + "\n"
+            
+            # Create and show dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Dataset Statistics")
+            dialog.setMinimumWidth(800)  # Made wider for better visibility
+            dialog.setMinimumHeight(600)
+            
+            layout = QVBoxLayout()
+            
+            # Use QTextEdit for better formatting
+            text_display = QTextEdit()
+            text_display.setReadOnly(True)
+            text_display.setFont(QFont("Courier New", 10))  # Use monospace font
+            text_display.setText(stats_str)
+            
+            layout.addWidget(text_display)
+            dialog.setLayout(layout)
+            
+            dialog.exec_()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to generate statistics: {str(e)}")
+            print(f"Statistics error: {e}")
 
     def save_query(self):
         query_data = {
@@ -640,8 +770,8 @@ class PolarsQueryApp(QMainWindow):
             self.query_builder.setVisible(True)
 
     def add_query_condition(self, field_name, field_type):
-        condition = QueryConditionWidget(field_name, field_type, self.query_builder)
-        self.query_builder.conditions_layout.addWidget(condition)
+        """Add a new condition to the query builder"""
+        self.query_builder.add_condition(field_name, field_type)
 
     def get_query_conditions(self):
         conditions = []
