@@ -1,9 +1,9 @@
 # Import required modules
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QPushButton, QTableView, QLineEdit,
-    QComboBox, QLabel, QWidget, QFileDialog, QTextEdit, QMessageBox, QDateEdit
+    QComboBox, QLabel, QWidget, QFileDialog, QTextEdit, QMessageBox, QDateEdit, QListWidget
 )
-from PySide6.QtCore import Qt, QMimeData, QPoint
+from PySide6.QtCore import Qt, QMimeData, QPoint, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QKeySequence, QShortcut, QDrag
 import pyperclip
 import polars as pl
@@ -37,10 +37,12 @@ class QueryConditionWidget(QWidget):
             self.operator_combo.addItems(['is set', 'is not set', 'equals', 'does not equal', 'contains'])
             self.value_widget = QLineEdit()
         
-        # Connect signals for live query preview
-        self.operator_combo.currentTextChanged.connect(self.parent().update_query_preview)
+        # Connect signals to the QueryBuilderWidget's update method
+        self.operator_combo.currentTextChanged.connect(self.value_changed)
         if isinstance(self.value_widget, QLineEdit):
-            self.value_widget.textChanged.connect(self.parent().update_query_preview)
+            self.value_widget.textChanged.connect(self.value_changed)
+        elif isinstance(self.value_widget, QDateEdit):
+            self.value_widget.dateChanged.connect(self.value_changed)
         
         layout.addWidget(self.field_label)
         layout.addWidget(self.operator_combo)
@@ -50,9 +52,22 @@ class QueryConditionWidget(QWidget):
         remove_btn.clicked.connect(self.remove_condition)
         layout.addWidget(remove_btn)
 
+    def value_changed(self):
+        # Find the QueryBuilderWidget parent and call its update method
+        parent = self.parent()
+        while parent and not isinstance(parent, QueryBuilderWidget):
+            parent = parent.parent()
+        if parent:
+            parent.update_query_preview()
+
     def remove_condition(self):
         self.deleteLater()
-        self.parent().update_query_preview()
+        # Update query preview after removal
+        parent = self.parent()
+        while parent and not isinstance(parent, QueryBuilderWidget):
+            parent = parent.parent()
+        if parent:
+            parent.update_query_preview()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -74,6 +89,138 @@ class QueryConditionWidget(QWidget):
             target_idx = self.parent().layout().indexOf(widget.parent())
             if current_idx != target_idx:
                 self.parent().move_condition(current_idx, target_idx)
+
+
+class FieldListWidget(QWidget):
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.layout = QVBoxLayout(self)
+        self.field_list = QListWidget()
+        self.field_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.field_list.itemDoubleClicked.connect(self.add_field_to_query)
+        self.layout.addWidget(self.field_list)
+        
+    def add_field_to_query(self, item):
+        selected_items = self.field_list.selectedItems()
+        for item in selected_items:
+            field_name = item.text()
+            field_type = 'date' if 'date' in field_name.lower() else 'text'
+            self.main_app.add_query_condition(field_name, field_type)
+
+
+class QueryBuilderWidget(QWidget):
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.layout = QVBoxLayout(self)
+        
+        # Operator buttons
+        self.operator_layout = QHBoxLayout()
+        self.and_btn = QPushButton("AND")
+        self.or_btn = QPushButton("OR")
+        self.bracket_left_btn = QPushButton("(")
+        self.bracket_right_btn = QPushButton(")")
+        
+        self.operator_layout.addWidget(self.and_btn)
+        self.operator_layout.addWidget(self.or_btn)
+        self.operator_layout.addWidget(self.bracket_left_btn)
+        self.operator_layout.addWidget(self.bracket_right_btn)
+        
+        self.layout.addLayout(self.operator_layout)
+        
+        # Conditions container
+        self.conditions_widget = QWidget()
+        self.conditions_layout = QVBoxLayout(self.conditions_widget)
+        self.layout.addWidget(self.conditions_widget)
+        
+        # Add Run Query button
+        self.run_query_btn = QPushButton("Run Query")
+        self.run_query_btn.clicked.connect(self.main_app.run_query)
+        self.run_query_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                padding: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        self.layout.addWidget(self.run_query_btn)
+
+    def update_query_preview(self):
+        """Update the SQL-like query preview based on current conditions"""
+        query_parts = []
+        for i in range(self.conditions_layout.count()):
+            widget = self.conditions_layout.itemAt(i).widget()
+            if isinstance(widget, QueryConditionWidget):
+                field = widget.field_label.text()
+                operator = widget.operator_combo.currentText()
+                if isinstance(widget.value_widget, QDateEdit):
+                    value = widget.value_widget.date().toString("yyyy-MM-dd")
+                else:
+                    value = widget.value_widget.text()
+                query_parts.append(f"{field} {operator} '{value}'")
+        
+        query = " AND ".join(query_parts)
+        self.main_app.query_preview.setText(query)
+
+
+class PolarsTableModel(QAbstractTableModel):
+    def __init__(self, data=None):
+        super().__init__()
+        self._data = data
+
+    def rowCount(self, index):
+        if self._data is None:
+            return 0
+        return len(self._data)
+
+    def columnCount(self, index):
+        if self._data is None:
+            return 0
+        return len(self._data.columns)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid() or self._data is None:
+            return None
+
+        if role == Qt.DisplayRole:
+            value = self._data.row(index.row())[index.column()]
+            # Handle the þþ delimiter case
+            if value == 'þþ' or value == '\x14\x14':
+                return ''
+            # Remove þ characters if they're at start/end of value
+            if isinstance(value, str):
+                value = value.strip('þ')
+            # Format dates nicely
+            if isinstance(value, datetime):
+                return value.strftime('%Y-%m-%d %H:%M:%S')
+            # Handle None/null values
+            if value is None:
+                return ''
+            return str(value)
+
+        elif role == Qt.TextAlignmentRole:
+            value = self._data.row(index.row())[index.column()]
+            if isinstance(value, (int, float)):
+                return Qt.AlignRight | Qt.AlignVCenter
+            return Qt.AlignLeft | Qt.AlignVCenter
+
+        return None
+
+    def headerData(self, section, orientation, role):
+        if role == Qt.DisplayRole:
+            if orientation == Qt.Horizontal and self._data is not None:
+                # Get column name and remove any þ characters
+                header = str(self._data.columns[section])
+                header = header.strip('þ')
+                return header
+            if orientation == Qt.Vertical:
+                return str(section + 1)
+        return None
 
 
 class PolarsQueryApp(QMainWindow):
@@ -102,16 +249,26 @@ class PolarsQueryApp(QMainWindow):
         layout.addLayout(file_load_layout)
 
         # Query Builder Section
-        query_layout = QVBoxLayout()
-        self.query_field_selector = QComboBox()
-        self.query_builder = QTextEdit()
-        self.query_builder.setPlaceholderText("Build your query here...")
-        run_query_button = QPushButton("Run Query")
-        run_query_button.clicked.connect(self.run_query)
-        query_layout.addWidget(QLabel("Field Selector:"))
-        query_layout.addWidget(self.query_field_selector)
-        query_layout.addWidget(self.query_builder)
-        query_layout.addWidget(run_query_button)
+        query_layout = QHBoxLayout()
+        
+        # Field list on the left
+        field_list_container = QWidget()
+        field_list_layout = QVBoxLayout(field_list_container)
+        field_list_layout.addWidget(QLabel("Available Fields:"))
+        self.field_list = FieldListWidget(self, field_list_container)
+        field_list_layout.addWidget(self.field_list)
+        
+        # Query builder on the right
+        query_builder_container = QWidget()
+        query_builder_layout = QVBoxLayout(query_builder_container)
+        query_builder_layout.addWidget(QLabel("Query Builder:"))
+        self.query_builder = QueryBuilderWidget(self, query_builder_container)
+        query_builder_layout.addWidget(self.query_builder)
+        
+        # Add both widgets to the query layout
+        query_layout.addWidget(field_list_container, 1)
+        query_layout.addWidget(query_builder_container, 2)
+        
         layout.addLayout(query_layout)
 
         # Results Viewer Section
@@ -172,6 +329,10 @@ class PolarsQueryApp(QMainWindow):
         self.preview_toggle.clicked.connect(self.toggle_preview)
         layout.addWidget(self.preview_toggle)
 
+        # Initialize the table model
+        self.table_model = PolarsTableModel()
+        self.results_view.setModel(self.table_model)
+
         # Set central widget
         central_widget = QWidget()
         central_widget.setLayout(layout)
@@ -187,24 +348,96 @@ class PolarsQueryApp(QMainWindow):
                 # Determine file type and use appropriate loading parameters
                 file_extension = os.path.splitext(file_path)[1].lower()
                 if file_extension == '.dat':
-                    self.dataset = pl.read_csv(file_path, separator='\x14', quote_char=None)  # ASCII 20 (CTRL+T)
+                    # Load the DAT file and clean the data
+                    self.dataset = pl.read_csv(file_path, separator='\x14', quote_char=None)
+                    
+                    # Clean the column names
+                    self.dataset.columns = [col.strip('þ') for col in self.dataset.columns]
+                    
+                    # Clean the data - replace 'þþ' with None
+                    for col in self.dataset.columns:
+                        self.dataset = self.dataset.with_columns(
+                            pl.col(col).map_elements(
+                                lambda x: None if x in ['þþ', '\x14\x14'] else x.strip('þ') if isinstance(x, str) else x,
+                                return_dtype=pl.Utf8  # Specify return type as string
+                            ).alias(col)
+                        )
                 else:  # Default CSV handling
                     self.dataset = pl.read_csv(file_path)
                 
-                self.query_field_selector.clear()  # Clear existing items
-                self.query_field_selector.addItems(self.dataset.columns)
+                # Update field list
+                self.field_list.field_list.clear()
+                for column in self.dataset.columns:
+                    self.field_list.field_list.addItem(column)
+                
                 QMessageBox.information(self, "Success", "File loaded successfully!")
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load file: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to load file: {str(e)}")
+                print(f"Detailed error: {e}")  # For debugging
 
     def run_query(self):
-        query = self.query_builder.toPlainText()
+        if self.dataset is None:
+            QMessageBox.warning(self, "Warning", "Please load a dataset first!")
+            return
+
         try:
-            result_df = self.dataset.lazy().filter(eval(query)).collect()
-            self.result_df = result_df
-            QMessageBox.information(self, "Success", "Query executed successfully!")
+            # Build the query expression from conditions
+            query_conditions = []
+            for i in range(self.query_builder.conditions_layout.count()):
+                widget = self.query_builder.conditions_layout.itemAt(i).widget()
+                if isinstance(widget, QueryConditionWidget):
+                    field = widget.field_label.text()
+                    operator = widget.operator_combo.currentText()
+                    
+                    if isinstance(widget.value_widget, QDateEdit):
+                        value = widget.value_widget.date().toString("yyyy-MM-dd")
+                    else:
+                        value = widget.value_widget.text()
+
+                    # Convert the UI-friendly operators to Polars expressions
+                    if operator == "is set":
+                        condition = f"pl.col('{field}').is_not_null()"
+                    elif operator == "is not set":
+                        condition = f"pl.col('{field}').is_null()"
+                    elif operator == "equals":
+                        condition = f"pl.col('{field}') == '{value}'"
+                    elif operator == "does not equal":
+                        condition = f"pl.col('{field}') != '{value}'"
+                    elif operator == "contains":
+                        condition = f"pl.col('{field}').str.contains('{value}')"
+                    elif operator == "is before":
+                        condition = f"pl.col('{field}') < '{value}'"
+                    elif operator == "is after":
+                        condition = f"pl.col('{field}') > '{value}'"
+                    elif operator == "is on":
+                        condition = f"pl.col('{field}') == '{value}'"
+                    else:
+                        continue
+
+                    query_conditions.append(condition)
+
+            if not query_conditions:
+                QMessageBox.warning(self, "Warning", "Please add some query conditions first!")
+                return
+
+            # Combine conditions with AND
+            query_expr = " & ".join(query_conditions)
+            
+            # Execute the query
+            self.result_df = self.dataset.filter(eval(query_expr))
+            
+            # Update the table model with new results
+            self.table_model = PolarsTableModel(self.result_df)
+            self.results_view.setModel(self.table_model)
+            
+            # Resize columns to content
+            self.results_view.resizeColumnsToContents()
+            
+            # Show success message
+            QMessageBox.information(self, "Success", f"Query executed successfully! Found {len(self.result_df)} rows.")
+            
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to execute query: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to execute query: {str(e)}")
 
     def show_statistics(self):
         if self.dataset is None:
@@ -216,19 +449,16 @@ class PolarsQueryApp(QMainWindow):
         QMessageBox.information(self, "Statistics", stats_str)
 
     def save_query(self):
-        """Enhanced save query with template support"""
         query_data = {
-            'query': self.query_builder.toPlainText(),
             'conditions': self.get_query_conditions(),
             'timestamp': datetime.now().isoformat()
         }
         
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Query Template", "", "Query Templates (*.qry)")
+            self, "Save Query", "", "JSON files (*.json)")
         if file_path:
-            with open(file_path, 'wb') as f:
-                pickle.dump(query_data, f)
-            self.add_to_recent_queries(query_data['query'])
+            with open(file_path, 'w') as f:
+                json.dump(query_data, f)
 
     def load_query(self):
         file_dialog = QFileDialog(self)
@@ -268,8 +498,8 @@ class PolarsQueryApp(QMainWindow):
     def update_query_preview(self):
         """Update the SQL-like query preview based on current conditions"""
         query_parts = []
-        for i in range(self.query_conditions.count()):
-            widget = self.query_conditions.itemAt(i).widget()
+        for i in range(self.query_builder.conditions_layout.count()):
+            widget = self.query_builder.conditions_layout.itemAt(i).widget()
             if isinstance(widget, QueryConditionWidget):
                 field = widget.field_label.text()
                 operator = widget.operator_combo.currentText()
@@ -308,6 +538,23 @@ class PolarsQueryApp(QMainWindow):
         else:
             self.query_preview.setVisible(False)
             self.query_builder.setVisible(True)
+
+    def add_query_condition(self, field_name, field_type):
+        condition = QueryConditionWidget(field_name, field_type, self.query_builder)
+        self.query_builder.conditions_layout.addWidget(condition)
+
+    def get_query_conditions(self):
+        conditions = []
+        for i in range(self.query_builder.conditions_layout.count()):
+            widget = self.query_builder.conditions_layout.itemAt(i).widget()
+            if isinstance(widget, QueryConditionWidget):
+                condition = {
+                    'field': widget.field_label.text(),
+                    'operator': widget.operator_combo.currentText(),
+                    'value': widget.value_widget.text()
+                }
+                conditions.append(condition)
+        return conditions
 
 
 # Run the application
