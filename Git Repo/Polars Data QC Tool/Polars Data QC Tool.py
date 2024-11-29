@@ -32,21 +32,63 @@ class QueryConditionWidget(QWidget):
         
         if field_type == 'date':
             self.operator_combo.addItems(['is before', 'is after', 'is between', 'is on', 'is not set'])
+            
+            # Create calendar widgets
             self.value_widget = QDateEdit()
+            self.value_widget_end = QDateEdit()
+            
+            # Enable calendar popup for both widgets
+            self.value_widget.setCalendarPopup(True)
+            self.value_widget_end.setCalendarPopup(True)
+            
+            # Set date format for both widgets
+            self.value_widget.setDisplayFormat("MM/dd/yyyy")  # Match the DAT file format
+            self.value_widget_end.setDisplayFormat("MM/dd/yyyy")
+            
+            # Style the calendar popup
+            calendar_style = """
+                QCalendarWidget {
+                    background-color: white;
+                }
+                QCalendarWidget QToolButton {
+                    color: black;
+                    background-color: #f0f0f0;
+                    border: 1px solid #c0c0c0;
+                    border-radius: 3px;
+                }
+                QCalendarWidget QMenu {
+                    background-color: white;
+                }
+                QCalendarWidget QSpinBox {
+                    background-color: white;
+                }
+            """
+            self.value_widget.calendarWidget().setStyleSheet(calendar_style)
+            self.value_widget_end.calendarWidget().setStyleSheet(calendar_style)
+            
+            # Hide the end date widget initially
+            self.value_widget_end.hide()
+            
+            self.operator_combo.currentTextChanged.connect(self.update_date_widgets)
+            
+            layout.addWidget(self.field_label)
+            layout.addWidget(self.operator_combo)
+            layout.addWidget(self.value_widget)
+            layout.addWidget(self.value_widget_end)
         else:
             self.operator_combo.addItems(['is set', 'is not set', 'equals', 'does not equal', 'contains'])
             self.value_widget = QLineEdit()
-        
-        # Connect signals to the QueryBuilderWidget's update method
+            layout.addWidget(self.field_label)
+            layout.addWidget(self.operator_combo)
+            layout.addWidget(self.value_widget)
+
+        # Connect signals
         self.operator_combo.currentTextChanged.connect(self.value_changed)
-        if isinstance(self.value_widget, QLineEdit):
-            self.value_widget.textChanged.connect(self.value_changed)
-        elif isinstance(self.value_widget, QDateEdit):
+        if isinstance(self.value_widget, QDateEdit):
             self.value_widget.dateChanged.connect(self.value_changed)
-        
-        layout.addWidget(self.field_label)
-        layout.addWidget(self.operator_combo)
-        layout.addWidget(self.value_widget)
+            self.value_widget_end.dateChanged.connect(self.value_changed)
+        elif isinstance(self.value_widget, QLineEdit):
+            self.value_widget.textChanged.connect(self.value_changed)
         
         remove_btn = QPushButton("×")
         remove_btn.clicked.connect(self.remove_condition)
@@ -89,6 +131,12 @@ class QueryConditionWidget(QWidget):
             target_idx = self.parent().layout().indexOf(widget.parent())
             if current_idx != target_idx:
                 self.parent().move_condition(current_idx, target_idx)
+
+    def update_date_widgets(self, operator):
+        if operator == "is between":
+            self.value_widget_end.show()
+        else:
+            self.value_widget_end.hide()
 
 
 class FieldListWidget(QWidget):
@@ -354,14 +402,28 @@ class PolarsQueryApp(QMainWindow):
                     # Clean the column names
                     self.dataset.columns = [col.strip('þ') for col in self.dataset.columns]
                     
-                    # Clean the data - replace 'þþ' with None
+                    # Clean the data - replace 'þþ' with None and clean date strings
                     for col in self.dataset.columns:
-                        self.dataset = self.dataset.with_columns(
-                            pl.col(col).map_elements(
-                                lambda x: None if x in ['þþ', '\x14\x14'] else x.strip('þ') if isinstance(x, str) else x,
-                                return_dtype=pl.Utf8  # Specify return type as string
-                            ).alias(col)
-                        )
+                        if 'date' in col.lower():
+                            # Special handling for date columns
+                            self.dataset = self.dataset.with_columns(
+                                pl.col(col).map_elements(
+                                    lambda x: None if x in ['þþ', '\x14\x14'] 
+                                    else x.strip('þ').strip()[:10] if isinstance(x, str) 
+                                    else x,
+                                    return_dtype=pl.Utf8
+                                ).alias(col)
+                            )
+                        else:
+                            # Normal handling for non-date columns
+                            self.dataset = self.dataset.with_columns(
+                                pl.col(col).map_elements(
+                                    lambda x: None if x in ['þþ', '\x14\x14'] 
+                                    else x.strip('þ') if isinstance(x, str) 
+                                    else x,
+                                    return_dtype=pl.Utf8
+                                ).alias(col)
+                            )
                 else:  # Default CSV handling
                     self.dataset = pl.read_csv(file_path)
                 
@@ -390,29 +452,63 @@ class PolarsQueryApp(QMainWindow):
                     operator = widget.operator_combo.currentText()
                     
                     if isinstance(widget.value_widget, QDateEdit):
-                        value = widget.value_widget.date().toString("yyyy-MM-dd")
+                        # Input date format (from the DAT file)
+                        input_date_format = "%m/%d/%Y"
+                        # Get the date in the correct format
+                        value = widget.value_widget.date().toString("MM/dd/yyyy")
+                        
+                        if operator == "is before":
+                            condition = (
+                                f"pl.col('{field}')"
+                                f".str.strip_chars()"  # Use Polars strip_chars instead of strip
+                                f".str.slice(0, 10)"  # Take only the first 10 characters (MM/DD/YYYY)
+                                f".str.strptime(pl.Date, format='{input_date_format}')"
+                                f".lt(pl.lit('{value}').str.strptime(pl.Date, format='{input_date_format}'))"
+                            )
+                        elif operator == "is after":
+                            condition = (
+                                f"pl.col('{field}')"
+                                f".str.strip_chars()"
+                                f".str.slice(0, 10)"
+                                f".str.strptime(pl.Date, format='{input_date_format}')"
+                                f".gt(pl.lit('{value}').str.strptime(pl.Date, format='{input_date_format}'))"
+                            )
+                        elif operator == "is on":
+                            condition = (
+                                f"pl.col('{field}')"
+                                f".str.strip_chars()"
+                                f".str.slice(0, 10)"
+                                f".str.strptime(pl.Date, format='{input_date_format}')"
+                                f".eq(pl.lit('{value}').str.strptime(pl.Date, format='{input_date_format}'))"
+                            )
+                        elif operator == "is not set":
+                            condition = f"pl.col('{field}').is_null()"
+                        elif operator == "is between":
+                            start_date = value
+                            end_date = widget.value_widget_end.date().toString("MM/dd/yyyy")
+                            condition = (
+                                f"(pl.col('{field}').str.strip_chars().str.slice(0, 10)"
+                                f".str.strptime(pl.Date, format='{input_date_format}')"
+                                f".gt(pl.lit('{start_date}').str.strptime(pl.Date, format='{input_date_format}'))"
+                                f" & pl.col('{field}').str.strip_chars().str.slice(0, 10)"
+                                f".str.strptime(pl.Date, format='{input_date_format}')"
+                                f".lt(pl.lit('{end_date}').str.strptime(pl.Date, format='{input_date_format}')))"
+                            )
                     else:
                         value = widget.value_widget.text()
-
-                    # Convert the UI-friendly operators to Polars expressions
-                    if operator == "is set":
-                        condition = f"pl.col('{field}').is_not_null()"
-                    elif operator == "is not set":
-                        condition = f"pl.col('{field}').is_null()"
-                    elif operator == "equals":
-                        condition = f"pl.col('{field}') == '{value}'"
-                    elif operator == "does not equal":
-                        condition = f"pl.col('{field}') != '{value}'"
-                    elif operator == "contains":
-                        condition = f"pl.col('{field}').str.contains('{value}')"
-                    elif operator == "is before":
-                        condition = f"pl.col('{field}') < '{value}'"
-                    elif operator == "is after":
-                        condition = f"pl.col('{field}') > '{value}'"
-                    elif operator == "is on":
-                        condition = f"pl.col('{field}') == '{value}'"
-                    else:
-                        continue
+                        # Handle text field conditions
+                        if operator == "is set":
+                            condition = f"pl.col('{field}').is_not_null()"
+                        elif operator == "is not set":
+                            condition = f"pl.col('{field}').is_null()"
+                        elif operator == "equals":
+                            condition = f"pl.col('{field}') == '{value}'"
+                        elif operator == "does not equal":
+                            condition = f"pl.col('{field}') != '{value}'"
+                        elif operator == "contains":
+                            condition = f"pl.col('{field}').str.contains('{value}')"
+                        else:
+                            continue
 
                     query_conditions.append(condition)
 
@@ -422,6 +518,9 @@ class PolarsQueryApp(QMainWindow):
 
             # Combine conditions with AND
             query_expr = " & ".join(query_conditions)
+            
+            # Print the query for debugging
+            print(f"Executing query: {query_expr}")
             
             # Execute the query
             self.result_df = self.dataset.filter(eval(query_expr))
@@ -438,6 +537,7 @@ class PolarsQueryApp(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to execute query: {str(e)}")
+            print(f"Detailed error: {e}")  # For debugging
 
     def show_statistics(self):
         if self.dataset is None:
