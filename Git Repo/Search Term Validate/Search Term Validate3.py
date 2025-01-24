@@ -19,7 +19,7 @@ class EnhancedSearchTermValidator:
         self.bind_events()
         
         self.stop_words = set([
-            'a', 'about', 'after', 'all', 'also', 'an', 'and', 'another', 'any', 'are', 'as', 'at',
+            'a', 'about', 'after', 'all', 'also', 'an', 'another', 'any', 'are', 'as', 'at',
             'be', 'because', 'been', 'before', 'being', 'between', 'both', 'but', 'by',
             'came', 'can', 'come', 'could',
             'did', 'do',
@@ -32,7 +32,7 @@ class EnhancedSearchTermValidator:
             'like',
             'made', 'many', 'me', 'might', 'more', 'moreover', 'most', 'much', 'must', 'my',
             'never', 'not', 'now',
-            'of', 'on', 'only', 'or', 'other', 'our', 'out', 'over',
+            'of', 'on', 'only', 'other', 'our', 'out', 'over',
             'said', 'same', 'see', 'she', 'should', 'since', 'some', 'still', 'such',
             'take', 'than', 'that', 'the', 'their', 'them', 'then', 'there', 'therefore', 'these',
             'they', 'this', 'those', 'through', 'thus', 'to', 'too',
@@ -177,7 +177,13 @@ class EnhancedSearchTermValidator:
                 else:
                     suggestion = f"Suggested wildcard(s): {wildcard_suggestion}"
                 if edited_term is None:
-                    edited_term = term  # Keep the original term, just suggest wildcards
+                    edited_term = term
+        
+        # Debug print to check what's being returned
+        print(f"Term: {term}")
+        print(f"Status: {status}")
+        print(f"Suggestion: {suggestion}")
+        print(f"Edited Term: {edited_term}")
         
         return (term, status, suggestion, edited_term)
 
@@ -211,7 +217,60 @@ class EnhancedSearchTermValidator:
     def suggest_fix(self, term, issues):
         suggestions = []
         edited_term = term
-        
+
+        if "Too long (> 455 characters)" in issues:
+            # Split the term into logical parts based on high-level operators
+            parts = []
+            
+            # First try to split on AND NOT if present
+            if ' AND NOT ' in term:
+                main_part, exclusions = term.split(' AND NOT ', 1)
+                
+                # Split the main part into smaller chunks if needed
+                if len(main_part) > 300:  # Leave room for exclusions
+                    # Split on high-level AND
+                    and_parts = main_part.split(' AND ')
+                    mid = len(and_parts) // 2
+                    
+                    # Create two new terms with the exclusions
+                    term1 = f"{' AND '.join(and_parts[:mid])} AND NOT {exclusions}"
+                    term2 = f"{' AND '.join(and_parts[mid:])} AND NOT {exclusions}"
+                    
+                    suggestions.append("Split search into two parts with shared exclusions:")
+                    edited_term = f"Part 1:\n{term1}\n\nPart 2:\n{term2}"
+                    return ("; ".join(suggestions), edited_term)
+            
+            # If no AND NOT or still too long, try splitting on high-level AND
+            elif ' AND ' in term:
+                parts = term.split(' AND ')
+                if len(parts) >= 2:
+                    mid = len(parts) // 2
+                    term1 = ' AND '.join(parts[:mid])
+                    term2 = ' AND '.join(parts[mid:])
+                    
+                    suggestions.append("Split search into two separate queries:")
+                    edited_term = f"Part 1:\n{term1}\n\nPart 2:\n{term2}"
+                    return ("; ".join(suggestions), edited_term)
+            
+            # If still no good split points, try splitting large OR groups
+            or_groups = re.findall(r'\(((?:[^()]+|\([^()]*\))*)\)', term)
+            for group in or_groups:
+                if len(group) > 200:  # If group is very large
+                    items = group.split(' OR ')
+                    if len(items) > 8:
+                        mid = len(items) // 2
+                        new_group1 = f"({' OR '.join(items[:mid])})"
+                        new_group2 = f"({' OR '.join(items[mid:])})"
+                        
+                        # Replace the original group with the split version
+                        term1 = term.replace(f"({group})", new_group1)
+                        term2 = term.replace(f"({group})", new_group2)
+                        
+                        suggestions.append("Split large OR group into separate queries:")
+                        edited_term = f"Query 1:\n{term1}\n\nQuery 2:\n{term2}"
+                        return ("; ".join(suggestions), edited_term)
+
+        # Handle other issues
         if "Unbalanced parentheses" in issues:
             open_count = term.count('(')
             close_count = term.count(')')
@@ -227,12 +286,6 @@ class EnhancedSearchTermValidator:
         if "Unmatched quotes" in issues:
             suggestions.append("Add a closing quote")
             edited_term += '"'
-        
-        if "Too long (> 455 characters)" in issues:
-            words = term.split()
-            mid = len(words) // 2
-            suggestions.append(f"Split into two terms")
-            edited_term = f"1. {' '.join(words[:mid])}\n2. {' '.join(words[mid:])}"
         
         if "Lowercase 'and'/'or' needs speech marks" in ' '.join(issues):
             edited_term = re.sub(r'\b(and|or)\b', lambda m: f'"{m.group(0)}"', edited_term, flags=re.IGNORECASE)
@@ -342,15 +395,29 @@ Warning and Error Categories:
         self.suggestions_text.config(state='normal')
         self.suggestions_text.delete("1.0", tk.END)
         
+        # Debug print to check what's being received
+        print("\nDisplaying Results:")
+        for result in results:
+            print(result)
+        
         for term, status, suggestion, edited_term in results:
+            # Display status in output text
             self.output_text.insert(tk.END, f"Term: {term}\nStatus: {status}\n\n")
+            
+            # Display suggestions and edited terms in suggestions text
             if suggestion or edited_term:
                 self.suggestions_text.insert(tk.END, f"Term: {term}\n")
                 if suggestion:
                     self.suggestions_text.insert(tk.END, f"Suggestion: {suggestion}\n")
                 if edited_term:
-                    self.suggestions_text.insert(tk.END, f"Edited Term: {edited_term}\n")
+                    # Format the edited term with proper line breaks
+                    formatted_edited_term = edited_term.replace("\n", "\n    ")
+                    self.suggestions_text.insert(tk.END, f"Edited Term:\n    {formatted_edited_term}\n")
                 self.suggestions_text.insert(tk.END, "\n")
+        
+        # Make sure to see the beginning of the text
+        self.suggestions_text.see("1.0")
+        self.output_text.see("1.0")
         
         self.output_text.config(state='disabled')
         self.suggestions_text.config(state='disabled')
